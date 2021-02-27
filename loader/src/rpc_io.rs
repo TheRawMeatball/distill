@@ -1,4 +1,4 @@
-use std::{error::Error, path::PathBuf, sync::Mutex};
+use std::{error::Error, path::PathBuf, rc::Rc, sync::Mutex};
 
 use capnp::message::ReaderOptions;
 use capnp_rpc::{pry, rpc_twoparty_capnp, twoparty, RpcSystem};
@@ -6,11 +6,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use distill_core::{utils, ArtifactMetadata, AssetMetadata, AssetUuid};
 use distill_schema::{data::asset_change_event, parse_db_metadata, service::asset_hub};
 use futures_util::AsyncReadExt;
-use tokio::{
-    net::TcpStream,
-    runtime::{Builder, Runtime},
-    sync::oneshot,
-};
+use tokio::net::TcpStream;
 
 use crate::{
     io::{DataRequest, LoaderIO, MetadataRequest, ResolveRequest},
@@ -36,15 +32,14 @@ struct SnapshotChange {
 
 enum InternalConnectionState {
     None,
-    Connecting(oneshot::Receiver<Result<RpcConnection, Box<dyn Error>>>),
+    Connecting(async_channel::Receiver<Result<RpcConnection, Box<dyn Error>>>),
     Connected(RpcConnection),
     Error(Box<dyn Error>),
 }
 
 /// the tokio::Runtime and tasks, as well as the connection state
 struct RpcRuntime {
-    runtime: Runtime,
-    local: tokio::task::LocalSet,
+    runtime: Rc<async_executor::LocalExecutor<'static>>,
     connection: InternalConnectionState,
 }
 
@@ -101,59 +96,64 @@ impl RpcRuntime {
             _ => {}
         };
 
-        let (conn_tx, conn_rx) = oneshot::channel();
+        let (conn_tx, conn_rx) = async_channel::bounded(1);
 
-        self.local.spawn_local(async move {
-            let result = async move {
-                log::trace!("Tcp connect to {:?}", connect_string);
-                let stream = TcpStream::connect(connect_string).await?;
-                stream.set_nodelay(true)?;
+        let executor = self.runtime.clone();
+        self.runtime
+            .spawn(async move {
+                let result = async move {
+                    log::trace!("Tcp connect to {:?}", connect_string);
+                    let stream = TcpStream::connect(connect_string).await?;
+                    stream.set_nodelay(true)?;
 
-                use tokio_util::compat::*;
-                let (reader, writer) = stream.compat().split();
+                    use tokio_util::compat::*;
+                    let (reader, writer) = stream.compat().split();
 
-                log::trace!("Creating capnp VatNetwork");
-                let rpc_network = Box::new(twoparty::VatNetwork::new(
-                    reader,
-                    writer,
-                    rpc_twoparty_capnp::Side::Client,
-                    *ReaderOptions::new()
-                        .nesting_limit(64)
-                        .traversal_limit_in_words(Some(256 * 1024 * 1024)),
-                ));
+                    log::trace!("Creating capnp VatNetwork");
+                    let rpc_network = Box::new(twoparty::VatNetwork::new(
+                        reader,
+                        writer,
+                        rpc_twoparty_capnp::Side::Client,
+                        *ReaderOptions::new()
+                            .nesting_limit(64)
+                            .traversal_limit_in_words(Some(256 * 1024 * 1024)),
+                    ));
 
-                let mut rpc_system = RpcSystem::new(rpc_network, None);
+                    let mut rpc_system = RpcSystem::new(rpc_network, None);
 
-                let hub: asset_hub::Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
+                    let hub: asset_hub::Client =
+                        rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
 
-                let _disconnector = rpc_system.get_disconnector();
+                    let _disconnector = rpc_system.get_disconnector();
 
-                tokio::task::spawn_local(rpc_system);
+                    executor.spawn(rpc_system);
 
-                log::trace!("Requesting RPC snapshot..");
-                let response = hub.get_snapshot_request().send().promise.await?;
+                    log::trace!("Requesting RPC snapshot..");
+                    let response = hub.get_snapshot_request().send().promise.await?;
 
-                let snapshot = response.get()?.get_snapshot()?;
-                log::trace!("Received snapshot, registering listener..");
-                let (snapshot_tx, snapshot_rx) = unbounded();
-                let listener: asset_hub::listener::Client = capnp_rpc::new_client(ListenerImpl {
-                    snapshot_channel: snapshot_tx,
-                    snapshot_change: None,
-                });
+                    let snapshot = response.get()?.get_snapshot()?;
+                    log::trace!("Received snapshot, registering listener..");
+                    let (snapshot_tx, snapshot_rx) = unbounded();
+                    let listener: asset_hub::listener::Client =
+                        capnp_rpc::new_client(ListenerImpl {
+                            snapshot_channel: snapshot_tx,
+                            snapshot_change: None,
+                        });
 
-                let mut request = hub.register_listener_request();
-                request.get().set_listener(listener);
-                let rpc_conn = request.send().promise.await.map(|_| RpcConnection {
-                    snapshot,
-                    snapshot_rx,
-                })?;
-                log::trace!("Registered listener, done connecting RPC loader.");
+                    let mut request = hub.register_listener_request();
+                    request.get().set_listener(listener);
+                    let rpc_conn = request.send().promise.await.map(|_| RpcConnection {
+                        snapshot,
+                        snapshot_rx,
+                    })?;
+                    log::trace!("Registered listener, done connecting RPC loader.");
 
-                Ok(rpc_conn)
-            }
-            .await;
-            let _ = conn_tx.send(result);
-        });
+                    Ok(rpc_conn)
+                }
+                .await;
+                let _ = conn_tx.send(result);
+            })
+            .detach();
 
         self.connection = InternalConnectionState::Connecting(conn_rx)
     }
@@ -183,8 +183,7 @@ impl RpcIO {
         Ok(RpcIO {
             connect_string,
             runtime: Mutex::new(RpcRuntime {
-                runtime: Builder::new_current_thread().enable_all().build()?,
-                local: tokio::task::LocalSet::new(),
+                runtime: Rc::new(async_executor::LocalExecutor::new()),
                 connection: InternalConnectionState::None,
             }),
             requests: Default::default(),
@@ -236,12 +235,10 @@ impl LoaderIO for RpcIO {
                             Ok(conn) => InternalConnectionState::Connected(conn),
                             Err(err) => InternalConnectionState::Error(err),
                         },
-                        Err(oneshot::error::TryRecvError::Closed) => {
-                            InternalConnectionState::Error(Box::new(
-                                oneshot::error::TryRecvError::Closed,
-                            ))
-                        }
-                        Err(oneshot::error::TryRecvError::Empty) => {
+                        Err(async_channel::TryRecvError::Closed) => InternalConnectionState::Error(
+                            Box::new(async_channel::TryRecvError::Closed),
+                        ),
+                        Err(async_channel::TryRecvError::Empty) => {
                             InternalConnectionState::Connecting(pending_connection)
                         }
                     }
@@ -249,16 +246,14 @@ impl LoaderIO for RpcIO {
                 c => c,
             };
 
-        runtime
-            .local
-            .block_on(&runtime.runtime, tokio::task::yield_now());
+        futures_lite::future::block_on(runtime.runtime.run(futures_lite::future::yield_now()));
 
         runtime.check_asset_changes(loader);
     }
 
-    fn with_runtime(&self, f: &mut dyn FnMut(&tokio::runtime::Runtime)) {
+    fn with_runtime(&self, f: &mut dyn FnMut(&async_executor::Executor<'_>)) {
         let runtime = self.runtime.lock().unwrap();
-        f(&runtime.runtime)
+        f(&runtime.runtime.inner)
     }
 }
 
@@ -334,46 +329,55 @@ fn process_requests(runtime: &mut RpcRuntime, requests: &mut QueuedRequests) {
         let len = requests.data_requests.len();
         for asset in requests.data_requests.drain(0..len) {
             let snapshot = connection.snapshot.clone();
-            runtime.local.spawn_local(async move {
-                match do_import_artifact_request(&asset, &snapshot).await {
-                    Ok(data) => {
-                        asset.complete(data);
+            runtime
+                .runtime
+                .spawn(async move {
+                    match do_import_artifact_request(&asset, &snapshot).await {
+                        Ok(data) => {
+                            asset.complete(data);
+                        }
+                        Err(e) => {
+                            asset.error(e);
+                        }
                     }
-                    Err(e) => {
-                        asset.error(e);
-                    }
-                }
-            });
+                })
+                .detach();
         }
 
         let len = requests.metadata_requests.len();
         for m in requests.metadata_requests.drain(0..len) {
             let snapshot = connection.snapshot.clone();
-            runtime.local.spawn_local(async move {
-                match do_metadata_request(&m, &snapshot).await {
-                    Ok(data) => {
-                        m.complete(data);
+            runtime
+                .runtime
+                .spawn(async move {
+                    match do_metadata_request(&m, &snapshot).await {
+                        Ok(data) => {
+                            m.complete(data);
+                        }
+                        Err(e) => {
+                            m.error(e);
+                        }
                     }
-                    Err(e) => {
-                        m.error(e);
-                    }
-                }
-            });
+                })
+                .detach();
         }
 
         let len = requests.resolve_requests.len();
         for m in requests.resolve_requests.drain(0..len) {
             let snapshot = connection.snapshot.clone();
-            runtime.local.spawn_local(async move {
-                match do_resolve_request(&m, &snapshot).await {
-                    Ok(data) => {
-                        m.complete(data);
+            runtime
+                .runtime
+                .spawn(async move {
+                    match do_resolve_request(&m, &snapshot).await {
+                        Ok(data) => {
+                            m.complete(data);
+                        }
+                        Err(e) => {
+                            m.error(e);
+                        }
                     }
-                    Err(e) => {
-                        m.error(e);
-                    }
-                }
-            });
+                })
+                .detach();
         }
     }
 }

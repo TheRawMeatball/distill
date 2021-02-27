@@ -197,7 +197,7 @@ impl LoaderIO for PackfileReader {
 
     fn tick(&mut self, _loader: &mut LoaderState) {}
 
-    fn with_runtime(&self, f: &mut dyn FnMut(&tokio::runtime::Runtime)) {
+    fn with_runtime(&self, f: &mut dyn FnMut(&async_executor::Executor<'_>)) {
         f(&self.0.runtime);
     }
 }
