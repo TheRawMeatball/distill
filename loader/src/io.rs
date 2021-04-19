@@ -1,5 +1,6 @@
 use std::{collections::HashMap, path::PathBuf};
 
+use bevy_tasks::TaskPool;
 use crossbeam_channel::Sender;
 use distill_core::{ArtifactId, ArtifactMetadata, AssetMetadata, AssetUuid};
 
@@ -10,8 +11,7 @@ pub trait LoaderIO: Send + Sync {
     fn get_asset_metadata_with_dependencies(&mut self, request: MetadataRequest);
     fn get_asset_candidates(&mut self, requests: Vec<ResolveRequest>);
     fn get_artifacts(&mut self, requests: Vec<DataRequest>);
-    fn tick(&mut self, loader: &mut LoaderState);
-    fn with_runtime(&self, f: &mut dyn FnMut(&tokio::runtime::Runtime));
+    fn init(&mut self, task_pool: TaskPool);
 }
 
 /// A request for an asset artifact's data.

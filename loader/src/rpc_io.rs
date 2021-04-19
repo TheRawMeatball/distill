@@ -1,16 +1,12 @@
 use std::{error::Error, path::PathBuf, sync::Mutex};
 
+use async_channel::{unbounded, Receiver, Sender};
+use async_net::TcpStream;
 use capnp::message::ReaderOptions;
 use capnp_rpc::{pry, rpc_twoparty_capnp, twoparty, RpcSystem};
-use crossbeam_channel::{unbounded, Receiver, Sender};
 use distill_core::{utils, AssetMetadata, AssetUuid};
 use distill_schema::{data::asset_change_event, parse_db_metadata, service::asset_hub};
-use futures_util::AsyncReadExt;
-use tokio::{
-    net::TcpStream,
-    runtime::{Builder, Runtime},
-    sync::oneshot,
-};
+use futures_util::{select_biased, AsyncReadExt, FutureExt, TryFutureExt};
 
 use crate::{
     io::{DataRequest, LoaderIO, MetadataRequest, MetadataRequestResult, ResolveRequest},
@@ -34,135 +30,14 @@ struct SnapshotChange {
     deleted_paths: Vec<PathBuf>,
 }
 
-enum InternalConnectionState {
-    None,
-    Connecting(oneshot::Receiver<Result<RpcConnection, Box<dyn Error>>>),
-    Connected(RpcConnection),
-    Error(Box<dyn Error>),
-}
-
-/// the tokio::Runtime and tasks, as well as the connection state
-struct RpcRuntime {
-    runtime: Runtime,
-    local: tokio::task::LocalSet,
-    connection: InternalConnectionState,
-}
-
-// While capnp_rpc does not impl Send or Sync, in our usage of the API there can only be one thread
-// accessing the internal state at any time due to Mutex. The !Send constraint in capnp_rpc is because
-// of internal object lifetime management that is unsafe in the face of multiple threads accessing data
-// from separate objects.
-unsafe impl Send for RpcRuntime {}
-
-impl RpcRuntime {
-    fn check_asset_changes(&mut self, loader: &LoaderState) {
-        self.connection =
-            match std::mem::replace(&mut self.connection, InternalConnectionState::None) {
-                InternalConnectionState::Connected(mut conn) => {
-                    if let Ok(change) = conn.snapshot_rx.try_recv() {
-                        log::trace!("RpcRuntime check_asset_changes Ok(change)");
-                        conn.snapshot = change.snapshot;
-                        let mut changed_assets = Vec::new();
-                        for asset in change.changed_assets {
-                            log::trace!(
-                                "RpcRuntime check_asset_changes changed asset.id: {:?}",
-                                asset
-                            );
-                            changed_assets.push(asset);
-                        }
-                        for asset in change.deleted_assets {
-                            log::trace!(
-                                "RpcRuntime check_asset_changes deleted asset.id: {:?}",
-                                asset
-                            );
-                            changed_assets.push(asset);
-                        }
-                        loader.invalidate_assets(&changed_assets);
-                        let mut changed_paths = Vec::new();
-                        for path in change.changed_paths {
-                            changed_paths.push(path);
-                        }
-                        for path in change.deleted_paths {
-                            changed_paths.push(path);
-                        }
-                        loader.invalidate_paths(&changed_paths);
-                    }
-                    InternalConnectionState::Connected(conn)
-                }
-                c => c,
-            };
-    }
-
-    fn connect(&mut self, connect_string: String) {
-        match self.connection {
-            InternalConnectionState::Connected(_) | InternalConnectionState::Connecting(_) => {
-                panic!("Trying to connect while already connected or connecting")
-            }
-            _ => {}
-        };
-
-        let (conn_tx, conn_rx) = oneshot::channel();
-
-        self.local.spawn_local(async move {
-            let result = async move {
-                log::trace!("Tcp connect to {:?}", connect_string);
-                let stream = TcpStream::connect(connect_string).await?;
-                stream.set_nodelay(true)?;
-
-                use tokio_util::compat::*;
-                let (reader, writer) = stream.compat().split();
-
-                log::trace!("Creating capnp VatNetwork");
-                let rpc_network = Box::new(twoparty::VatNetwork::new(
-                    reader,
-                    writer,
-                    rpc_twoparty_capnp::Side::Client,
-                    *ReaderOptions::new()
-                        .nesting_limit(64)
-                        .traversal_limit_in_words(Some(256 * 1024 * 1024)),
-                ));
-
-                let mut rpc_system = RpcSystem::new(rpc_network, None);
-
-                let hub: asset_hub::Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
-
-                let _disconnector = rpc_system.get_disconnector();
-
-                tokio::task::spawn_local(rpc_system);
-
-                log::trace!("Requesting RPC snapshot..");
-                let response = hub.get_snapshot_request().send().promise.await?;
-
-                let snapshot = response.get()?.get_snapshot()?;
-                log::trace!("Received snapshot, registering listener..");
-                let (snapshot_tx, snapshot_rx) = unbounded();
-                let listener: asset_hub::listener::Client = capnp_rpc::new_client(ListenerImpl {
-                    snapshot_channel: snapshot_tx,
-                    snapshot_change: None,
-                });
-
-                let mut request = hub.register_listener_request();
-                request.get().set_listener(listener);
-                let rpc_conn = request.send().promise.await.map(|_| RpcConnection {
-                    snapshot,
-                    snapshot_rx,
-                })?;
-                log::trace!("Registered listener, done connecting RPC loader.");
-
-                Ok(rpc_conn)
-            }
-            .await;
-            let _ = conn_tx.send(result);
-        });
-
-        self.connection = InternalConnectionState::Connecting(conn_rx)
-    }
-}
-
 pub struct RpcIO {
     connect_string: String,
-    runtime: Mutex<RpcRuntime>,
-    requests: QueuedRequests,
+    data_requests: Sender<DataRequest>,
+    metadata_requests: Sender<MetadataRequest>,
+    resolve_requests: Sender<ResolveRequest>,
+    data_requests_rx: Receiver<DataRequest>,
+    metadata_requests_rx: Receiver<MetadataRequest>,
+    resolve_requests_rx: Receiver<ResolveRequest>,
 }
 
 #[derive(Default)]
@@ -180,85 +55,187 @@ impl Default for RpcIO {
 
 impl RpcIO {
     pub fn new(connect_string: String) -> std::io::Result<RpcIO> {
+        let (metadata_requests, metadata_requests_rx) = unbounded();
+        let (data_requests, data_requests_rx) = unbounded();
+        let (resolve_requests, resolve_requests_rx) = unbounded();
         Ok(RpcIO {
             connect_string,
-            runtime: Mutex::new(RpcRuntime {
-                runtime: Builder::new_current_thread().enable_all().build()?,
-                local: tokio::task::LocalSet::new(),
-                connection: InternalConnectionState::None,
-            }),
-            requests: Default::default(),
+            metadata_requests,
+            metadata_requests_rx,
+            data_requests,
+            data_requests_rx,
+            resolve_requests,
+            resolve_requests_rx,
         })
     }
 }
 
 impl LoaderIO for RpcIO {
     fn get_asset_metadata_with_dependencies(&mut self, request: MetadataRequest) {
-        self.requests.metadata_requests.push(request);
-        let mut runtime = self.runtime.lock().unwrap();
-        process_requests(&mut runtime, &mut self.requests);
+        self.metadata_requests.try_send(request);
+        // process_requests(&mut runtime, &mut self.requests);
     }
 
     fn get_asset_candidates(&mut self, requests: Vec<ResolveRequest>) {
-        self.requests.resolve_requests.extend(requests);
-        let mut runtime = self.runtime.lock().unwrap();
-        process_requests(&mut runtime, &mut self.requests);
+        requests
+            .into_iter()
+            .map(|r| self.resolve_requests.try_send(r))
+            .for_each(Result::unwrap);
+        // process_requests(&mut runtime, &mut self.requests);
     }
 
     fn get_artifacts(&mut self, requests: Vec<DataRequest>) {
-        self.requests.data_requests.extend(requests);
-        let mut runtime = self.runtime.lock().unwrap();
-        process_requests(&mut runtime, &mut self.requests);
+        requests
+            .into_iter()
+            .map(|r| self.data_requests.try_send(r))
+            .for_each(Result::unwrap);
+        // process_requests(&mut runtime, &mut self.requests);
     }
 
-    fn tick(&mut self, loader: &mut LoaderState) {
-        let mut runtime = self.runtime.lock().unwrap();
+    fn init(&mut self, task_pool: bevy_tasks::TaskPool) {
+        let connect_string = self.connect_string.clone();
+        let task_pool = task_pool.clone();
+        let data_requests_rx = self.data_requests_rx.clone();
+        let metadata_requests_rx = self.metadata_requests_rx.clone();
+        let resolve_requests_rx = self.resolve_requests_rx.clone();
+        task_pool
+            .spawn_local(async move {
+                let result = async move {
+                    log::trace!("Tcp connect to {:?}", connect_string);
+                    let stream = TcpStream::connect(connect_string).await?;
+                    stream.set_nodelay(true)?;
 
-        match &runtime.connection {
-            InternalConnectionState::Error(err) => {
-                log::error!("Error connecting RpcIO: {}", err);
-                runtime.connect(self.connect_string.clone());
-            }
-            InternalConnectionState::None => {
-                runtime.connect(self.connect_string.clone());
-            }
-            _ => {}
-        };
+                    let (reader, writer) = stream.split();
 
-        process_requests(&mut runtime, &mut self.requests);
+                    log::trace!("Creating capnp VatNetwork");
+                    let rpc_network = Box::new(twoparty::VatNetwork::new(
+                        reader,
+                        writer,
+                        rpc_twoparty_capnp::Side::Client,
+                        *ReaderOptions::new()
+                            .nesting_limit(64)
+                            .traversal_limit_in_words(Some(256 * 1024 * 1024)),
+                    ));
 
-        runtime.connection =
-            match std::mem::replace(&mut runtime.connection, InternalConnectionState::None) {
-                // update connection state
-                InternalConnectionState::Connecting(mut pending_connection) => {
-                    match pending_connection.try_recv() {
-                        Ok(connection_result) => match connection_result {
-                            Ok(conn) => InternalConnectionState::Connected(conn),
-                            Err(err) => InternalConnectionState::Error(err),
-                        },
-                        Err(oneshot::error::TryRecvError::Closed) => {
-                            InternalConnectionState::Error(Box::new(
-                                oneshot::error::TryRecvError::Closed,
-                            ))
-                        }
-                        Err(oneshot::error::TryRecvError::Empty) => {
-                            InternalConnectionState::Connecting(pending_connection)
-                        }
-                    }
+                    let mut rpc_system = RpcSystem::new(rpc_network, None);
+
+                    let hub: asset_hub::Client =
+                        rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
+
+                    let _disconnector = rpc_system.get_disconnector();
+
+                    task_pool.spawn_local(rpc_system);
+
+                    log::trace!("Requesting RPC snapshot..");
+                    let response = hub.get_snapshot_request().send().promise.await?;
+
+                    let snapshot = response.get()?.get_snapshot()?;
+                    log::trace!("Received snapshot, registering listener..");
+                    let (snapshot_tx, snapshot_rx) = unbounded();
+                    let listener: asset_hub::listener::Client =
+                        capnp_rpc::new_client(ListenerImpl {
+                            snapshot_channel: snapshot_tx,
+                            snapshot_change: None,
+                        });
+
+                    let mut request = hub.register_listener_request();
+                    request.get().set_listener(listener);
+                    let rpc_conn = request.send().promise.await.map(|_| RpcConnection {
+                        snapshot,
+                        snapshot_rx,
+                    })?;
+                    log::trace!("Registered listener, done connecting RPC loader.");
+
+                    Ok::<_, Box<dyn Error>>(rpc_conn)
                 }
-                c => c,
-            };
+                .await;
+                let conn = result.unwrap();
 
-        runtime
-            .local
-            .block_on(&runtime.runtime, tokio::task::yield_now());
-
-        runtime.check_asset_changes(loader);
-    }
-
-    fn with_runtime(&self, f: &mut dyn FnMut(&tokio::runtime::Runtime)) {
-        let runtime = self.runtime.lock().unwrap();
-        f(&runtime.runtime)
+                task_pool.spawn(async move {
+                    let mut conn = conn;
+                    loop {
+                        let snapshot_rx = conn.snapshot_rx.recv().fuse();
+                        let data_requests_rx = data_requests_rx.recv().fuse();
+                        let metadata_requests_rx = metadata_requests_rx.recv().fuse();
+                        let resolve_requests_rx = resolve_requests_rx.recv().fuse();
+                        let on_snapshot_recv = |change: SnapshotChange| {
+                            log::trace!("RpcRuntime check_asset_changes Ok(change)");
+                            conn.snapshot = change.snapshot;
+                            let mut changed_assets = Vec::new();
+                            for asset in change.changed_assets {
+                                log::trace!(
+                                    "RpcRuntime check_asset_changes changed asset.id: {:?}",
+                                    asset
+                                );
+                                changed_assets.push(asset);
+                            }
+                            for asset in change.deleted_assets {
+                                log::trace!(
+                                    "RpcRuntime check_asset_changes deleted asset.id: {:?}",
+                                    asset
+                                );
+                                changed_assets.push(asset);
+                            }
+                            // TODO: pipe loader tx s into init so this can work
+                            loader.invalidate_assets(&changed_assets);
+                            let mut changed_paths = Vec::new();
+                            for path in change.changed_paths {
+                                changed_paths.push(path);
+                            }
+                            for path in change.deleted_paths {
+                                changed_paths.push(path);
+                            }
+                            loader.invalidate_paths(&changed_paths);
+                        };
+                        let on_data = |asset| {
+                            let snapshot = conn.snapshot.clone();
+                            task_pool.spawn_local(async move {
+                                match do_import_artifact_request(&asset, &snapshot).await {
+                                    Ok(data) => {
+                                        asset.complete(data);
+                                    }
+                                    Err(e) => {
+                                        asset.error(e);
+                                    }
+                                }
+                            });
+                        };
+                        let on_metadata = |m| {
+                            let snapshot = conn.snapshot.clone();
+                            task_pool.spawn_local(async move {
+                                match do_metadata_request(&m, &snapshot).await {
+                                    Ok(data) => {
+                                        m.complete(data);
+                                    }
+                                    Err(e) => {
+                                        m.error(e);
+                                    }
+                                }
+                            });
+                        };
+                        let on_resolve = |m| {
+                            let snapshot = conn.snapshot.clone();
+                            task_pool.spawn_local(async move {
+                                match do_resolve_request(&m, &snapshot).await {
+                                    Ok(data) => {
+                                        m.complete(data);
+                                    }
+                                    Err(e) => {
+                                        m.error(e);
+                                    }
+                                }
+                            });
+                        };
+                        select_biased! {
+                            change = snapshot_rx => on_snapshot_recv(change.unwrap()),
+                            data = data_requests_rx => on_data(data.unwrap()),
+                            metadata = metadata_requests_rx => on_metadata(metadata.unwrap()),
+                            resolve = resolve_requests_rx => on_resolve(resolve.unwrap()),
+                        };
+                    }
+                });
+            })
+            .detach();
     }
 }
 
@@ -337,55 +314,6 @@ async fn do_resolve_request(
     Ok(results)
 }
 
-fn process_requests(runtime: &mut RpcRuntime, requests: &mut QueuedRequests) {
-    if let InternalConnectionState::Connected(connection) = &runtime.connection {
-        let len = requests.data_requests.len();
-        for asset in requests.data_requests.drain(0..len) {
-            let snapshot = connection.snapshot.clone();
-            runtime.local.spawn_local(async move {
-                match do_import_artifact_request(&asset, &snapshot).await {
-                    Ok(data) => {
-                        asset.complete(data);
-                    }
-                    Err(e) => {
-                        asset.error(e);
-                    }
-                }
-            });
-        }
-
-        let len = requests.metadata_requests.len();
-        for m in requests.metadata_requests.drain(0..len) {
-            let snapshot = connection.snapshot.clone();
-            runtime.local.spawn_local(async move {
-                match do_metadata_request(&m, &snapshot).await {
-                    Ok(data) => {
-                        m.complete(data);
-                    }
-                    Err(e) => {
-                        m.error(e);
-                    }
-                }
-            });
-        }
-
-        let len = requests.resolve_requests.len();
-        for m in requests.resolve_requests.drain(0..len) {
-            let snapshot = connection.snapshot.clone();
-            runtime.local.spawn_local(async move {
-                match do_resolve_request(&m, &snapshot).await {
-                    Ok(data) => {
-                        m.complete(data);
-                    }
-                    Err(e) => {
-                        m.error(e);
-                    }
-                }
-            });
-        }
-    }
-}
-
 struct ListenerImpl {
     snapshot_channel: Sender<SnapshotChange>,
     snapshot_change: Option<u64>,
@@ -453,6 +381,7 @@ impl asset_hub::listener::Server for ListenerImpl {
                         changed_paths,
                     })
                     .map_err(|_| capnp::Error::failed("Could not send SnapshotChange".into()))
+                    .await
             });
         } else {
             let _ = self.snapshot_channel.try_send(SnapshotChange {

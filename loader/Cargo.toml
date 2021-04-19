@@ -10,8 +10,9 @@ description = "Loader component of the asset pipeline `distill`."
 crossbeam-channel = "0.5.0"
 distill-core = { path = "../core", version = "=0.0.2", features = ["serde-1"] }
 distill-schema = { path = "../schema", version = "=0.0.2", optional = true }
-tokio = { version = "1.2", features = ["net", "sync", "rt", "rt-multi-thread"], optional = true }
-tokio-util = { version = "0.6.1", features = ["compat"], optional = true }
+bevy_tasks = "0.5.0"
+async-net = "1.5.0"
+async-channel = "1.6.1"
 futures-util = { version = "0.3", default-features = false, features = ["io"], optional = true }
 futures-channel = { version = "0.3", default-features = false, features = ["alloc"] }
 futures-core = { version = "0.3", default-features = false, features = ["alloc"] }
@@ -29,17 +30,14 @@ thread_local = { version = "1.0", optional = true }
 default = ["rpc_io", "handle", "packfile_io"]
 packfile_io = [
     "distill-schema",
-    "tokio",
     "capnp",
     "capnp-rpc",
-    "tokio-util",
     "futures-util",
     "memmap",
     "thread_local",
 ]
 rpc_io = [
     "distill-schema",
-    "tokio",
     "capnp",
     "capnp-rpc",
     "futures-util",

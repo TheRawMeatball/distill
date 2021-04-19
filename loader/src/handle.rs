@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     fmt::Debug,
     hash::Hash,
@@ -263,9 +264,9 @@ impl AssetHandle for WeakHandle {
     }
 }
 
-tokio::task_local! {
-    static LOADER: &'static dyn LoaderInfoProvider;
-    static REFOP_SENDER: Sender<RefOp>;
+thread_local! {
+    static LOADER: RefCell<Option<&'static dyn LoaderInfoProvider>> = Default::default();
+    static REFOP_SENDER: RefCell<Option<Sender<RefOp>>> = Default::default();
 }
 
 /// Used to make some limited Loader interactions available to `serde` Serialize/Deserialize
@@ -273,13 +274,16 @@ tokio::task_local! {
 pub struct SerdeContext;
 impl SerdeContext {
     pub fn with_active<R>(f: impl FnOnce(&dyn LoaderInfoProvider, &Sender<RefOp>) -> R) -> R {
-        LOADER.with(|l| REFOP_SENDER.with(|r| f(*l, &r)))
+        LOADER.with(|l| {
+            REFOP_SENDER.with(|r| f(&*l.borrow().unwrap(), &r.borrow().as_ref().unwrap()))
+        })
     }
 
-    pub async fn with<F>(loader: &dyn LoaderInfoProvider, sender: Sender<RefOp>, f: F) -> F::Output
-    where
-        F: Future,
-    {
+    pub fn with<R>(
+        loader: &dyn LoaderInfoProvider,
+        sender: Sender<RefOp>,
+        f: impl FnOnce() -> R,
+    ) -> R {
         // The loader lifetime needs to be transmuted to 'static to be able to be stored in task_local.
         // This is safe since SerdeContext's lifetime cannot be shorter than the opened scope, and the loader
         // must live at least as long.
@@ -287,7 +291,17 @@ impl SerdeContext {
             std::mem::transmute::<&dyn LoaderInfoProvider, &'static dyn LoaderInfoProvider>(loader)
         };
 
-        LOADER.scope(loader, REFOP_SENDER.scope(sender, f)).await
+        LOADER.with(move |v| {
+            *v.borrow_mut() = Some(loader);
+            let r = REFOP_SENDER.with(move |v| {
+                *v.borrow_mut() = Some(sender);
+                let r = f();
+                *v.borrow_mut() = None;
+                r
+            });
+            *v.borrow_mut() = None;
+            r
+        })
     }
 }
 
@@ -371,10 +385,10 @@ struct DummySerdeContextHandle {
     dummy: Arc<DummySerdeContext>,
 }
 impl<'a> distill_core::importer_context::ImporterContextHandle for DummySerdeContextHandle {
-    fn scope<'s>(&'s self, fut: BoxFuture<'s, ()>) -> BoxFuture<'s, ()> {
+    fn scope(&self, f: Box<dyn FnOnce()>) {
         let sender = self.dummy.ref_sender.clone();
         let loader = &*self.dummy;
-        Box::pin(SerdeContext::with(loader, sender, fut))
+        Box::pin(SerdeContext::with(loader, sender, f));
     }
 
     fn resolve_ref(&mut self, asset_ref: &AssetRef, asset: AssetUuid) {

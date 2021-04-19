@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use bevy_tasks::TaskPool;
 use capnp::serialize::SliceSegments;
 use distill_core::{utils::make_array, AssetMetadata, AssetRef, AssetUuid};
 use distill_schema::pack::pack_file;
@@ -56,12 +57,11 @@ struct PackfileReaderInner {
     reader: PackfileMessageReader,
     index_by_uuid: HashMap<AssetUuid, u32>,
     assets_by_path: HashMap<String, Vec<u32>>,
-    runtime: tokio::runtime::Runtime,
 }
-pub struct PackfileReader(Arc<PackfileReaderInner>);
+pub struct PackfileReader(Arc<PackfileReaderInner>, Option<TaskPool>);
 
 impl PackfileReader {
-    pub fn new(file: File) -> capnp::Result<Self> {
+    pub fn new(file: File, tp: TaskPool) -> capnp::Result<Self> {
         let message_reader = PackfileMessageReader::new(file)?;
         let reader = message_reader.get_reader()?;
         let mut index_by_uuid = HashMap::new();
@@ -78,12 +78,14 @@ impl PackfileReader {
                 .or_insert_with(|| vec![idx as u32]);
         }
 
-        Ok(PackfileReader(Arc::new(PackfileReaderInner {
-            reader: message_reader,
-            index_by_uuid,
-            assets_by_path,
-            runtime: tokio::runtime::Builder::new_multi_thread().build()?,
-        })))
+        Ok(PackfileReader(
+            Arc::new(PackfileReaderInner {
+                reader: message_reader,
+                index_by_uuid,
+                assets_by_path,
+            }),
+            None,
+        ))
     }
 }
 
@@ -168,45 +170,49 @@ impl PackfileReaderInner {
 
 impl LoaderIO for PackfileReader {
     fn get_asset_metadata_with_dependencies(&mut self, request: MetadataRequest) {
-        let _guard = self.0.runtime.enter();
         let inner = self.0.clone();
-        tokio::spawn(async move {
-            match inner.get_asset_metadata_with_dependencies_impl(&request) {
-                Ok(data) => request.complete(data),
-                Err(err) => request.error(err),
-            }
-        });
-    }
-
-    fn get_asset_candidates(&mut self, requests: Vec<ResolveRequest>) {
-        let _guard = self.0.runtime.enter();
-        for request in requests {
-            let inner = self.0.clone();
-            tokio::spawn(async move {
-                match inner.get_asset_candidates_impl(&request) {
+        self.1
+            .unwrap()
+            .spawn(async move {
+                match inner.get_asset_metadata_with_dependencies_impl(&request) {
                     Ok(data) => request.complete(data),
                     Err(err) => request.error(err),
                 }
-            });
+            })
+            .detach();
+    }
+
+    fn get_asset_candidates(&mut self, requests: Vec<ResolveRequest>) {
+        for request in requests {
+            let inner = self.0.clone();
+            self.1
+                .unwrap()
+                .spawn(async move {
+                    match inner.get_asset_candidates_impl(&request) {
+                        Ok(data) => request.complete(data),
+                        Err(err) => request.error(err),
+                    }
+                })
+                .detach();
         }
     }
 
     fn get_artifacts(&mut self, requests: Vec<DataRequest>) {
-        let _guard = self.0.runtime.enter();
         for request in requests {
             let inner = self.0.clone();
-            tokio::spawn(async move {
-                match inner.get_artifact_impl(&request) {
-                    Ok(data) => request.complete(data),
-                    Err(err) => request.error(err),
-                }
-            });
+            self.1
+                .unwrap()
+                .spawn(async move {
+                    match inner.get_artifact_impl(&request) {
+                        Ok(data) => request.complete(data),
+                        Err(err) => request.error(err),
+                    }
+                })
+                .detach();
         }
     }
 
-    fn tick(&mut self, _loader: &mut LoaderState) {}
-
-    fn with_runtime(&self, f: &mut dyn FnMut(&tokio::runtime::Runtime)) {
-        f(&self.0.runtime);
+    fn init(&mut self, task_pool: TaskPool) {
+        self.1 = Some(task_pool);
     }
 }
